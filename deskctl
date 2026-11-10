@@ -1,0 +1,503 @@
+#!/usr/bin/env python3
+"""deskctl -- give an agent eyes and hands on a Linux desktop.
+
+Every command prints exactly one JSON object on stdout, so an agent can parse
+the result without scraping. Exit code is 0 on success, 1 on failure.
+
+Backends are picked from the running session:
+  * Wayland/Hyprland: grim for screenshots, hyprctl for windows,
+    build/wayinput (virtual-keyboard + virtual-pointer protocols) for input.
+  * X11: import/scrot, wmctrl, xdotool.
+
+No root, no /dev/uinput, no kernel module.
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import struct
+import subprocess
+import sys
+import time
+
+VERSION = "0.1.0"
+HERE = os.path.dirname(os.path.realpath(__file__))
+DESKCTL_LIB = None  # rewritten by `make install`
+
+
+# --------------------------------------------------------------- utilities
+
+def run(argv, timeout=30, check=False):
+    """Run argv, return (rc, stdout, stderr) as text."""
+    try:
+        p = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+        return p.returncode, p.stdout, p.stderr
+    except FileNotFoundError:
+        return 127, "", f"{argv[0]}: command not found"
+    except subprocess.TimeoutExpired:
+        return 124, "", f"{argv[0]}: timed out after {timeout}s"
+
+
+def need(tool):
+    path = shutil.which(tool)
+    if not path:
+        fail(f"required tool not found on PATH: {tool}")
+    return path
+
+
+def emit(obj):
+    print(json.dumps(obj, ensure_ascii=False, sort_keys=False))
+    sys.exit(0 if obj.get("ok", True) else 1)
+
+
+def fail(msg, **extra):
+    obj = {"ok": False, "error": msg}
+    obj.update(extra)
+    emit(obj)
+
+
+def session():
+    if os.environ.get("WAYLAND_DISPLAY"):
+        return "wayland"
+    if os.environ.get("DISPLAY"):
+        return "x11"
+    fail("no Wayland or X11 session detected "
+         "(WAYLAND_DISPLAY and DISPLAY are both unset)")
+
+
+def compositor():
+    if os.environ.get("HYPRLAND_INSTANCE_SIGNATURE") and shutil.which("hyprctl"):
+        return "hyprland"
+    if os.environ.get("SWAYSOCK") and shutil.which("swaymsg"):
+        return "sway"
+    desktop = os.environ.get("XDG_CURRENT_DESKTOP", "")
+    return desktop.lower() or "unknown"
+
+
+def find_wayinput():
+    cands = [
+        os.environ.get("DESKCTL_WAYINPUT"),
+        os.path.join(HERE, "build", "wayinput"),
+        os.path.join(HERE, "wayinput"),
+    ]
+    if DESKCTL_LIB:
+        cands.append(os.path.join(DESKCTL_LIB, "wayinput"))
+    cands += [
+        "/usr/local/lib/deskctl/wayinput",
+        "/usr/lib/deskctl/wayinput",
+        shutil.which("wayinput"),
+    ]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            return c
+    return None
+
+
+def png_size(path):
+    with open(path, "rb") as f:
+        head = f.read(24)
+    if len(head) < 24 or head[:8] != b"\x89PNG\r\n\x1a\n":
+        return None, None
+    w, h = struct.unpack(">II", head[16:24])
+    return w, h
+
+
+def hypr_json(cmd, args):
+    rc, out, err = run(["hyprctl", cmd] + args)
+    if rc != 0:
+        fail(f"hyprctl {cmd} failed: {err.strip() or out.strip()}")
+    text = out.strip()
+    # Some hyprctl versions prepend warnings; keep the JSON part only.
+    start = min((i for i in (text.find("["), text.find("{")) if i >= 0), default=-1)
+    if start > 0:
+        text = text[start:]
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError as e:
+        fail(f"cannot parse hyprctl output: {e}", raw=out[:500])
+
+
+# ---------------------------------------------------------------- windows
+
+def windows_hyprland():
+    raw = hypr_json("clients", ["-j"]) or []
+    active = active_window_hyprland() or {}
+    wins = []
+    for c in raw:
+        x, y = c.get("at", [0, 0])
+        w, h = c.get("size", [0, 0])
+        wins.append({
+            "address": c.get("address"),
+            "class": c.get("class"),
+            "title": c.get("title"),
+            "x": x, "y": y, "w": w, "h": h,
+            "workspace": (c.get("workspace") or {}).get("name"),
+            "pid": c.get("pid"),
+            "mapped": c.get("mapped"),
+            "focused": c.get("address") == active.get("address"),
+        })
+    return wins
+
+
+def active_window_hyprland():
+    raw = hypr_json("activewindow", ["-j"])
+    if not raw:
+        return None
+    return {"address": raw.get("address"), "class": raw.get("class"),
+            "title": raw.get("title"),
+            "x": raw.get("at", [0, 0])[0], "y": raw.get("at", [0, 0])[1],
+            "w": raw.get("size", [0, 0])[0], "h": raw.get("size", [0, 0])[1]}
+
+
+def windows_sway():
+    rc, out, err = run(["swaymsg", "-t", "get_tree", "--raw"])
+    if rc != 0:
+        fail(f"swaymsg failed: {err.strip()}")
+    tree = json.loads(out)
+    wins = []
+
+    def walk(node):
+        if node.get("type") == "con" and node.get("name") and node.get("app_id"):
+            rect = node.get("rect", {})
+            wins.append({
+                "address": node.get("id"),
+                "class": node.get("app_id"),
+                "title": node.get("name"),
+                "x": rect.get("x", 0), "y": rect.get("y", 0),
+                "w": rect.get("width", 0), "h": rect.get("height", 0),
+                "focused": node.get("focused", False),
+                "pid": node.get("pid"),
+                "mapped": True,
+            })
+        for child in node.get("nodes", []) + node.get("floating_nodes", []):
+            walk(child)
+
+    walk(tree)
+    return wins
+
+
+def windows_x11():
+    rc, out, err = run(["wmctrl", "-lG"])
+    if rc != 0:
+        fail(f"wmctrl failed: {err.strip()}")
+    wins = []
+    for line in out.splitlines():
+        parts = line.split(None, 7)
+        if len(parts) < 8:
+            continue
+        wid, desk, x, y, w, h, host, title = parts
+        wins.append({"address": wid, "class": None, "title": title,
+                     "x": int(x), "y": int(y), "w": int(w), "h": int(h),
+                     "workspace": desk, "focused": False, "pid": None,
+                     "mapped": True})
+    return wins
+
+
+def windows():
+    comp = compositor()
+    if comp == "hyprland":
+        return windows_hyprland()
+    if comp == "sway":
+        return windows_sway()
+    return windows_x11()
+
+
+def active_window():
+    comp = compositor()
+    if comp == "hyprland":
+        return active_window_hyprland()
+    wins = [w for w in windows() if w.get("focused")]
+    return wins[0] if wins else None
+
+
+def match_window(pattern):
+    """Return (matches, exactness). Exact class beats class-substring beats title."""
+    pat = pattern.lower()
+    wins = [w for w in windows() if w.get("mapped", True)]
+    exact = [w for w in wins if (w.get("class") or "").lower() == pat]
+    if exact:
+        return exact
+    by_class = [w for w in wins if pat in (w.get("class") or "").lower()]
+    if by_class:
+        return by_class
+    by_title = [w for w in wins if pat in (w.get("title") or "").lower()]
+    return by_title
+
+
+def focus_window(win):
+    comp = compositor()
+    addr = win.get("address")
+    if comp == "hyprland":
+        attempts = [
+            ["hyprctl", "dispatch", f"focuswindow address:{addr}"],
+            ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "address:{addr}" }})'],
+            ["hyprctl", "dispatch", f'hl.dsp.focus({{ window = "class:{win.get("class")}" }})'],
+        ]
+        for argv in attempts:
+            rc, out, err = run(argv)
+            time.sleep(0.15)
+            cur = active_window_hyprland() or {}
+            if cur.get("address") == addr:
+                return True
+        return False
+    if comp == "sway":
+        rc, _, _ = run(["swaymsg", f'[con_id={addr}] focus'])
+        return rc == 0
+    rc, _, _ = run(["wmctrl", "-i", "-a", addr])
+    return rc == 0
+
+
+def focus_or_fail(pattern):
+    matches = match_window(pattern)
+    if not matches:
+        fail(f"no window matches {pattern!r}", windows=[w["title"] for w in windows()])
+    if len(matches) > 1:
+        fail(f"{len(matches)} windows match {pattern!r}; be more specific",
+             candidates=[{"class": m["class"], "title": m["title"]} for m in matches])
+    if not focus_window(matches[0]):
+        fail(f"could not focus window {matches[0]['title']!r}")
+    return matches[0]
+
+
+# ------------------------------------------------------------------ input
+
+def wayinput(args):
+    exe = find_wayinput()
+    if not exe:
+        fail("build/wayinput not found; run `make` in the deskctl repo")
+    rc, out, err = run([exe] + args, timeout=20)
+    if rc != 0:
+        fail(f"wayinput {' '.join(args)} failed: {err.strip()}", rc=rc)
+    return out.strip()
+
+
+def x11_input(kind, **kw):
+    need("xdotool")
+    if kind == "type":
+        run(["xdotool", "type", "--clearmodifiers", "--delay", "0", "--", kw["text"]])
+    elif kind == "key":
+        run(["xdotool", "key", "--clearmodifiers", kw["combo"]])
+    elif kind == "move":
+        run(["xdotool", "mousemove", str(kw["x"]), str(kw["y"])])
+    elif kind == "click":
+        run(["xdotool", "mousemove", str(kw["x"]), str(kw["y"])])
+        run(["xdotool", "click", "--repeat", str(kw["count"]), str(kw["button"])])
+    elif kind == "scroll":
+        btn = "4" if kw["dy"] > 0 else "5"
+        run(["xdotool", "click", "--repeat", str(max(1, abs(kw["dy"]))), btn])
+
+
+def do_input(kind, window_pattern=None, **kw):
+    target = None
+    if window_pattern:
+        target = focus_or_fail(window_pattern)
+        time.sleep(0.1)
+        cur = active_window()
+        if not cur or cur.get("address") != target.get("address"):
+            fail("window lost focus before input was sent; aborting",
+                 expected=target.get("title"),
+                 actual=(cur or {}).get("title"))
+    sess = session()
+    if sess == "wayland":
+        if kind == "type":
+            wayinput(["type", kw["text"]])
+        elif kind == "key":
+            wayinput(["key", kw["combo"]])
+        elif kind == "move":
+            wayinput(["move", str(kw["x"]), str(kw["y"])])
+        elif kind == "click":
+            wayinput(["click", str(kw["x"]), str(kw["y"]), kw["button"], str(kw["count"])])
+        elif kind == "scroll":
+            wayinput(["scroll", str(kw["dy"]), str(kw.get("dx", 0))])
+    else:
+        x11_input(kind, **kw)
+
+    cur = active_window() or {}
+    emit({"ok": True, "action": kind, "target": {"class": cur.get("class"),
+                                                 "title": cur.get("title")},
+          "args": kw if kw else None})
+
+
+# ------------------------------------------------------------- screenshots
+
+def shot(path=None, window_pattern=None):
+    sess = session()
+    out = path or os.path.join(os.getcwd(), f"shot-{int(time.time())}.png")
+    if sess == "wayland":
+        need("grim")
+        argv = ["grim"]
+        if window_pattern:
+            matches = match_window(window_pattern)
+            if len(matches) != 1:
+                fail(f"{len(matches)} windows match {window_pattern!r}; need exactly one")
+            w = matches[0]
+            argv += ["-g", f"{w['x']},{w['y']} {w['w']}x{w['h']}"]
+        argv.append(out)
+        rc, _, err = run(argv)
+        if rc != 0:
+            fail(f"grim failed: {err.strip()}")
+    else:
+        tool = shutil.which("import") or need("scrot")
+        if os.path.basename(tool) == "scrot":
+            rc, _, err = run([tool, "-o", out])
+        else:
+            rc, _, err = run([tool, "-window", "root", out])
+        if rc != 0:
+            fail(f"screenshot failed: {err.strip()}")
+
+    w, h = png_size(out)
+    emit({"ok": True, "path": os.path.abspath(out), "width": w, "height": h,
+          "bytes": os.path.getsize(out)})
+
+
+# ---------------------------------------------------------------- commands
+
+def cmd_info(_args):
+    sess = session()
+    info = {
+        "ok": True,
+        "version": VERSION,
+        "session": sess,
+        "compositor": compositor(),
+        "wayinput": find_wayinput(),
+        "capabilities": {
+            "screenshot": bool(shutil.which("grim") if sess == "wayland" else shutil.which("import")),
+            "windows": compositor() in ("hyprland", "sway") or bool(shutil.which("wmctrl")),
+            "input": bool(find_wayinput()) if sess == "wayland" else bool(shutil.which("xdotool")),
+        },
+    }
+    if sess == "wayland" and find_wayinput():
+        rc, out, err = run([find_wayinput(), "screen"], timeout=5)
+        if rc == 0:
+            try:
+                w, h = out.strip().split("x")
+                info["screen"] = {"width": int(w), "height": int(h)}
+            except ValueError:
+                pass
+        else:
+            info["screen_error"] = err.strip()
+    emit(info)
+
+
+def cmd_windows(_args):
+    wins = windows()
+    for w in wins:
+        w["id"] = w.pop("address", None)
+    emit({"ok": True, "count": len(wins), "windows": wins})
+
+
+def cmd_focus(args):
+    win = focus_or_fail(args.pattern)
+    emit({"ok": True, "focused": {"class": win["class"], "title": win["title"]}})
+
+
+def cmd_shot(args):
+    shot(args.output, args.window)
+
+
+def cmd_type(args):
+    do_input("type", args.window, text=args.text)
+
+
+def cmd_key(args):
+    do_input("key", args.window, combo=args.combo)
+
+
+def cmd_move(args):
+    do_input("move", None, x=args.x, y=args.y)
+
+
+def cmd_click(args):
+    do_input("click", args.window, x=args.x, y=args.y, button=args.button, count=args.count)
+
+
+def cmd_scroll(args):
+    do_input("scroll", None, dy=args.dy, dx=args.dx)
+
+
+def cmd_wait(args):
+    deadline = time.time() + args.timeout
+    while time.time() < deadline:
+        m = match_window(args.pattern)
+        if m:
+            emit({"ok": True, "waited": round(time.time() - (deadline - args.timeout), 2),
+                  "windows": [{"class": w["class"], "title": w["title"]} for w in m]})
+        time.sleep(0.2)
+    fail(f"timeout after {args.timeout}s waiting for {args.pattern!r}")
+
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="deskctl",
+        description="Agent-facing desktop control for Linux (Wayland first, X11 fallback).",
+        epilog="Every command prints one JSON object on stdout.")
+    p.add_argument("--version", action="version", version=f"deskctl {VERSION}")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    s = sub.add_parser("info", help="describe session, compositor and capabilities")
+    s.set_defaults(func=cmd_info)
+
+    s = sub.add_parser("windows", help="list windows as JSON")
+    s.set_defaults(func=cmd_windows)
+
+    s = sub.add_parser("focus", help="focus a window by class/title substring")
+    s.add_argument("pattern")
+    s.set_defaults(func=cmd_focus)
+
+    s = sub.add_parser("shot", help="take a screenshot")
+    s.add_argument("-o", "--output")
+    s.add_argument("--window", help="capture only this window (class/title substring)")
+    s.set_defaults(func=cmd_shot)
+
+    s = sub.add_parser("type", help="type text into the focused window")
+    s.add_argument("text")
+    s.add_argument("--window", help="focus this window first and verify focus")
+    s.set_defaults(func=cmd_type)
+
+    s = sub.add_parser("key", help="press a key combo, e.g. ctrl+shift+t")
+    s.add_argument("combo")
+    s.add_argument("--window")
+    s.set_defaults(func=cmd_key)
+
+    s = sub.add_parser("move", help="move the pointer to absolute x y")
+    s.add_argument("x", type=int)
+    s.add_argument("y", type=int)
+    s.set_defaults(func=cmd_move)
+
+    s = sub.add_parser("click", help="click at absolute x y")
+    s.add_argument("x", type=int)
+    s.add_argument("y", type=int)
+    s.add_argument("--button", default="left", choices=["left", "right", "middle"])
+    s.add_argument("--count", type=int, default=1)
+    s.add_argument("--window")
+    s.set_defaults(func=cmd_click)
+
+    s = sub.add_parser("scroll", help="scroll wheel notches (+down, -up)")
+    s.add_argument("dy", type=float)
+    s.add_argument("--dx", type=float, default=0.0)
+    s.set_defaults(func=cmd_scroll)
+
+    s = sub.add_parser("wait", help="wait until a window matching a pattern exists")
+    s.add_argument("pattern")
+    s.add_argument("--timeout", type=float, default=10.0)
+    s.set_defaults(func=cmd_wait)
+
+    return p
+
+
+def main():
+    args = build_parser().parse_args()
+    try:
+        args.func(args)
+    except BrokenPipeError:
+        sys.exit(0)
+    except KeyboardInterrupt:
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
